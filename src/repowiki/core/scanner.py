@@ -33,6 +33,8 @@ _SKIP_EXTS = {
     ".wasm",
 }
 
+_MINIFIED_SOURCE_EXTS = {".js", ".mjs", ".cjs", ".css"}
+
 _LANG_MAP = {
     ".py": "python", ".pyi": "python",
     ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
@@ -112,6 +114,24 @@ def _is_binary(data: bytes) -> bool:
     return b"\x00" in data[:1024]
 
 
+def _has_skipped_suffix(path: Path) -> bool:
+    name = path.name.lower()
+    return any(name.endswith(ext) for ext in _SKIP_EXTS)
+
+
+def _looks_minified_source(path: str, text: str) -> bool:
+    if Path(path).suffix.lower() not in _MINIFIED_SOURCE_EXTS:
+        return False
+
+    lines = text.splitlines() or [text]
+    longest = max(len(line) for line in lines)
+    if longest < 1000:
+        return False
+
+    non_empty = [line for line in lines if line.strip()]
+    return len(non_empty) <= 5 or longest > len(text) * 0.5
+
+
 def detect_language(path: str) -> str:
     name = Path(path).name.lower()
     if name == "dockerfile" or name.startswith("dockerfile."):
@@ -187,7 +207,7 @@ def scan_directory(
             if full.is_symlink():
                 continue
 
-            if full.suffix.lower() in _SKIP_EXTS:
+            if _has_skipped_suffix(full):
                 continue
 
             try:
@@ -207,6 +227,9 @@ def scan_directory(
             try:
                 text = raw.decode("utf-8", errors="replace")
             except Exception:
+                continue
+
+            if _looks_minified_source(rel, text):
                 continue
 
             lang = detect_language(rel)

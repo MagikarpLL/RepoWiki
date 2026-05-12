@@ -53,6 +53,7 @@ Automatically generates structured documentation for any codebase:
 - **Module documentation** — purpose, key files, relationships, important functions
 - **Architecture diagrams** — auto-detected architecture type with Mermaid visualizations
 - **Reading guide** — "start here" path based on PageRank file importance ranking
+- **Bundle-aware scanner** — skips minified JS/CSS and generated frontend chunks before they burn LLM context
 
 ### Multiple Output Formats
 - **Markdown** — directory of `.md` files, ready to commit to your repo
@@ -140,7 +141,7 @@ RepoWiki/
 
 ## How It Works
 
-1. **Scan** — Walk the directory tree, filter out binaries and generated files, detect languages and entry points
+1. **Scan** — Walk the directory tree, filter out binaries, generated bundles, and oversized files, detect languages and entry points
 2. **Graph** — Parse import statements across 6 languages, build a dependency graph, run PageRank to rank file importance
 3. **Analyze** — Send file tree + key files to LLM in 4 structured passes (overview, modules, architecture, reading guide)
 4. **Cache** — Store results in SQLite keyed by content hash, skip unchanged files on re-scan
