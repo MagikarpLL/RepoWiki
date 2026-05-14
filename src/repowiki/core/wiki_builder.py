@@ -98,8 +98,14 @@ class WikiBuilder:
         if overview.description:
             lines.append(f"{overview.description}\n")
 
+        if overview.project_type:
+            lines.append(f"**Project Type:** {overview.project_type}\n")
+
+        if overview.entry_points:
+            lines.append("**Entry Points:** " + ", ".join(f"`{e}`" for e in overview.entry_points) + "\n")
+
         if overview.tech_stack:
-            lines.append("## Tech Stack\n")
+            lines.append("\n## Tech Stack\n")
             for t in overview.tech_stack:
                 ver = f" {t.version}" if t.version else ""
                 cat = f" ({t.category})" if t.category else ""
@@ -107,13 +113,13 @@ class WikiBuilder:
             lines.append("")
 
         if overview.key_features:
-            lines.append("## Key Features\n")
+            lines.append("\n## Key Features\n")
             for feat in overview.key_features:
                 lines.append(f"- {feat}")
             lines.append("")
 
         if overview.setup_instructions:
-            lines.append("## Getting Started\n")
+            lines.append("\n## Getting Started\n")
             for i, step in enumerate(overview.setup_instructions, 1):
                 lines.append(f"{i}. {step}")
             lines.append("")
@@ -164,9 +170,11 @@ class WikiBuilder:
                 if f.purpose:
                     lines.append(f"{f.purpose}\n")
                 if f.key_symbols:
+                    lines.append("**Key Symbols:**\n")
                     for s in f.key_symbols:
-                        desc = f" - {s.description}" if s.description else ""
-                        lines.append(f"- `{s.name}` ({s.kind}){desc}")
+                        line_ref = f" (line {s.line})" if s.line > 0 else ""
+                        desc = f" — {s.description}" if s.description else ""
+                        lines.append(f"- `{s.name}` ({s.kind}){line_ref}{desc}")
                     lines.append("")
 
         if mod.key_concepts:

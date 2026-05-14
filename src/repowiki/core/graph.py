@@ -104,17 +104,59 @@ class DependencyGraph:
         if not mod_deps:
             return ""
 
+        # Get module file counts for descriptions
+        module_files: dict[str, int] = {}
+        for node in self.graph.nodes:
+            mod = _get_module(node)
+            module_files[mod] = module_files.get(mod, 0) + 1
+
         lines = ["graph TD"]
         seen_edges = set()
+
+        # Group modules by type based on naming conventions
+        frontend_mods = set()
+        backend_mods = set()
+        ui_mods = {"components", "pages", "views", "ui", "frontend", "client", "web"}
+
+        for mod in mod_deps:
+            mod_lower = mod.lower()
+            if any(ui in mod_lower for ui in ui_mods):
+                frontend_mods.add(mod)
+            else:
+                backend_mods.add(mod)
+
+        # Add subgraphs for better visualization
+        if frontend_mods and backend_mods:
+            lines.append("  subgraph Frontend")
+            for mod in sorted(frontend_mods):
+                count = module_files.get(mod, 0)
+                s = _mermaid_id(mod)
+                lines.append(f"    {s}[({mod} - {count} files)]")
+            lines.append("  end")
+            lines.append("  subgraph Backend")
+            for mod in sorted(backend_mods):
+                if mod not in frontend_mods:
+                    count = module_files.get(mod, 0)
+                    s = _mermaid_id(mod)
+                    lines.append(f"    {s}[({mod} - {count} files)]")
+            lines.append("  end")
+            lines.append("")
+        else:
+            # Simple visualization without subgraphs
+            for mod, count in sorted(module_files.items(), key=lambda x: -x[1])[:12]:
+                s = _mermaid_id(mod)
+                lines.append(f"  {s}[({mod} - {count} files)]")
+
+        # Add edges
+        lines.append("")
         for src, targets in sorted(mod_deps.items()):
             for dst in sorted(targets):
                 edge = (src, dst)
                 if edge not in seen_edges:
                     seen_edges.add(edge)
-                    # sanitize node names for Mermaid
                     s = _mermaid_id(src)
                     d = _mermaid_id(dst)
-                    lines.append(f"  {s}[{src}] --> {d}[{dst}]")
+                    lines.append(f"  {s} --> {d}")
 
         return "\n".join(lines)
 
