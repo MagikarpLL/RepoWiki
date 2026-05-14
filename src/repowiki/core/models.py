@@ -44,6 +44,8 @@ class ProjectOverview(BaseModel):
     name: str = ""
     one_liner: str = ""
     description: str = ""
+    project_type: str = ""  # backend, frontend, cli-tool, library, full-stack, etc.
+    entry_points: list[str] = Field(default_factory=list)  # likely entry point files
     tech_stack: list[TechItem] = Field(default_factory=list)
     setup_instructions: list[str] = Field(default_factory=list)
     key_features: list[str] = Field(default_factory=list)
