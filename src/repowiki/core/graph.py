@@ -1,175 +1,227 @@
-"""dependency graph construction and PageRank ranking."""
+"""dependency graph construction and PageRank ranking.
+
+This module provides backward compatibility through the DependencyGraph class,
+which delegates to PreciseDependencyGraph while maintaining the original interface.
+"""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Optional
 
 import networkx as nx
 
 from repowiki.core.models import ProjectContext
-
-# import pattern regexes by language
-_IMPORT_PATTERNS = {
-    "python": [
-        re.compile(r"^\s*import\s+([\w.]+)", re.MULTILINE),
-        re.compile(r"^\s*from\s+([\w.]+)\s+import", re.MULTILINE),
-    ],
-    "javascript": [
-        re.compile(r"""import\s+.*?\s+from\s+['"]([^'"]+)['"]""", re.MULTILINE),
-        re.compile(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)""", re.MULTILINE),
-    ],
-    "typescript": [
-        re.compile(r"""import\s+.*?\s+from\s+['"]([^'"]+)['"]""", re.MULTILINE),
-        re.compile(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)""", re.MULTILINE),
-    ],
-    "go": [
-        re.compile(r'"([^"]+)"', re.MULTILINE),
-    ],
-    "rust": [
-        re.compile(r"^\s*use\s+([\w:]+)", re.MULTILINE),
-        re.compile(r"^\s*mod\s+(\w+)", re.MULTILINE),
-    ],
-    "java": [
-        re.compile(r"^\s*import\s+([\w.]+);", re.MULTILINE),
-    ],
-}
-
-# also cover jsx/tsx/mjs etc
-for alias in ("jsx", "tsx", "mjs", "cjs"):
-    _IMPORT_PATTERNS[alias] = _IMPORT_PATTERNS["javascript"]
+from repowiki.core.precise_graph import PreciseDependencyGraph
+from repowiki.core.parsers import create_parser_registry
 
 
 class DependencyGraph:
-    """file dependency graph with PageRank scoring."""
+    """File dependency graph with PageRank scoring.
 
-    def __init__(self):
-        self.graph = nx.DiGraph()
-        self._file_paths: set[str] = set()
+    This class provides backward compatibility by wrapping PreciseDependencyGraph.
+    Internally, it uses the new parser registry for precise AST-based parsing.
+    """
+
+    def __init__(self, precise_graph: Optional[PreciseDependencyGraph] = None):
+        """Initialize the dependency graph.
+
+        Args:
+            precise_graph: Optional PreciseDependencyGraph to wrap.
+                          If None, will be built via build_from_project().
+        """
+        self._precise = precise_graph or PreciseDependencyGraph()
+        self.graph = self._to_networkx()
 
     @classmethod
     def build_from_project(cls, project: ProjectContext) -> DependencyGraph:
-        dg = cls()
+        """Build dependency graph from a project.
+
+        Args:
+            project: ProjectContext with files to analyze
+
+        Returns:
+            DependencyGraph instance
+        """
+        registry = create_parser_registry()
         path_set = {f.path for f in project.files}
-        dg._file_paths = path_set
 
-        # add all files as nodes
-        for f in project.files:
-            dg.graph.add_node(f.path, language=f.language, lines=f.lines)
+        # Build files list for PreciseDependencyGraph
+        files = [
+            {
+                "path": f.path,
+                "language": f.language,
+                "lines": f.lines,
+                "content": f.content or f.preview,
+            }
+            for f in project.files
+        ]
 
-        # parse imports and create edges
-        for f in project.files:
-            content = f.content or f.preview
+        # Create PreciseDependencyGraph using the parser registry
+        precise = PreciseDependencyGraph()
+
+        # Add all file nodes
+        for f in files:
+            precise.add_file(f["path"], f["language"], f["lines"])
+
+        # Parse imports using the registry and create edges
+        for f in files:
+            content = f.get("content") or f.get("preview", "")
             if not content:
                 continue
 
-            patterns = _IMPORT_PATTERNS.get(f.language, [])
-            for pat in patterns:
-                for match in pat.finditer(content):
-                    import_path = match.group(1)
-                    resolved = _resolve_import(import_path, f.path, f.language, path_set)
-                    if resolved and resolved != f.path:
-                        dg.graph.add_edge(f.path, resolved)
+            imports = registry.parse(content, f["language"], f["path"])
+            for imp in imports:
+                from repowiki.core.precise_graph import ImportKind
 
-        return dg
+                # Convert string kind to ImportKind enum
+                kind_mapping = {
+                    "import": ImportKind.IMPORT,
+                    "from": ImportKind.FROM,
+                    "require": ImportKind.REQUIRE,
+                    "static": ImportKind.STATIC_IMPORT,
+                    "wildcard": ImportKind.WILDCARD,
+                    "table": ImportKind.TABLE_REFERENCE,
+                    "view": ImportKind.VIEW_REFERENCE,
+                    "procedure": ImportKind.PROCEDURE_CALL,
+                    "function": ImportKind.FUNCTION_CALL,
+                    "sql_file": ImportKind.SQL_FILE_REFERENCE,
+                }
+                import_kind = kind_mapping.get(imp.kind, ImportKind.IMPORT)
+
+                # Resolve target file
+                target_file = registry.resolve(
+                    imp.module, f["path"], f["language"], path_set
+                )
+
+                from repowiki.core.precise_graph import ImportStatement
+
+                precise.add_import(
+                    ImportStatement(
+                        source_file=f["path"],
+                        target_module=imp.module,
+                        target_file=target_file,
+                        import_kind=import_kind,
+                        line_number=imp.line,
+                        is_external=imp.is_external,
+                        raw_statement=imp.raw,
+                    )
+                )
+
+        return cls(precise_graph=precise)
+
+    def _to_networkx(self) -> nx.DiGraph:
+        """Convert to NetworkX DiGraph for backward compatibility.
+
+        Returns:
+            nx.DiGraph with nodes and edges
+        """
+        g = nx.DiGraph()
+        for path, node in self._precise.files.items():
+            g.add_node(path, language=node.language, lines=node.lines)
+        for imp in self._precise.imports:
+            if imp.target_file and imp.source_file != imp.target_file:
+                g.add_edge(imp.source_file, imp.target_file)
+        return g
 
     def rank_files(self) -> list[tuple[str, float]]:
-        """return files ranked by PageRank (most important first)."""
-        if not self.graph.nodes:
-            return []
-        try:
-            scores = nx.pagerank(self.graph, alpha=0.85)
-        except Exception:
-            # fallback: uniform scores if PageRank fails (missing numpy, convergence, etc.)
-            scores = {n: 1.0 / len(self.graph) for n in self.graph}
-        return sorted(scores.items(), key=lambda x: -x[1])
+        """Return files ranked by PageRank (most important first).
+
+        Returns:
+            List of (file_path, score) tuples sorted by score descending
+        """
+        return self._precise.rank_files()
 
     def get_core_files(self, top_n: int = 10) -> list[str]:
-        """top N most important files by PageRank."""
-        return [path for path, _ in self.rank_files()[:top_n]]
+        """Get top N most important files by PageRank.
+
+        Args:
+            top_n: Number of files to return
+
+        Returns:
+            List of file paths
+        """
+        return self._precise.get_core_files(top_n)
 
     def get_module_dependencies(self) -> dict[str, set[str]]:
-        """edges between top-level directory modules."""
-        deps: dict[str, set[str]] = {}
-        for src, dst in self.graph.edges:
-            src_mod = _get_module(src)
-            dst_mod = _get_module(dst)
-            if src_mod != dst_mod:
-                deps.setdefault(src_mod, set()).add(dst_mod)
-        return deps
+        """Get edges between top-level directory modules.
+
+        Returns:
+            Dict mapping module name to set of dependent modules
+        """
+        return self._precise.get_module_dependencies()
 
     def to_mermaid(self) -> str:
-        """generate a Mermaid flowchart of inter-module dependencies."""
-        mod_deps = self.get_module_dependencies()
-        if not mod_deps:
-            return ""
+        """Generate a Mermaid flowchart of inter-module dependencies.
 
-        # Get module file counts for descriptions
-        module_files: dict[str, int] = {}
-        for node in self.graph.nodes:
-            mod = _get_module(node)
-            module_files[mod] = module_files.get(mod, 0) + 1
-
-        lines = ["graph TD"]
-        seen_edges = set()
-
-        # Group modules by type based on naming conventions
-        frontend_mods = set()
-        backend_mods = set()
-        ui_mods = {"components", "pages", "views", "ui", "frontend", "client", "web"}
-
-        for mod in mod_deps:
-            mod_lower = mod.lower()
-            if any(ui in mod_lower for ui in ui_mods):
-                frontend_mods.add(mod)
-            else:
-                backend_mods.add(mod)
-
-        # Add subgraphs for better visualization
-        if frontend_mods and backend_mods:
-            lines.append("  subgraph Frontend")
-            for mod in sorted(frontend_mods):
-                count = module_files.get(mod, 0)
-                s = _mermaid_id(mod)
-                lines.append(f"    {s}[({mod} - {count} files)]")
-            lines.append("  end")
-            lines.append("  subgraph Backend")
-            for mod in sorted(backend_mods):
-                if mod not in frontend_mods:
-                    count = module_files.get(mod, 0)
-                    s = _mermaid_id(mod)
-                    lines.append(f"    {s}[({mod} - {count} files)]")
-            lines.append("  end")
-            lines.append("")
-        else:
-            # Simple visualization without subgraphs
-            for mod, count in sorted(module_files.items(), key=lambda x: -x[1])[:12]:
-                s = _mermaid_id(mod)
-                lines.append(f"  {s}[({mod} - {count} files)]")
-
-        # Add edges
-        lines.append("")
-        for src, targets in sorted(mod_deps.items()):
-            for dst in sorted(targets):
-                edge = (src, dst)
-                if edge not in seen_edges:
-                    seen_edges.add(edge)
-                    s = _mermaid_id(src)
-                    d = _mermaid_id(dst)
-                    lines.append(f"  {s} --> {d}")
-
-        return "\n".join(lines)
+        Returns:
+            Mermaid diagram string
+        """
+        return self._precise.to_mermaid()
 
     def get_entry_points(self) -> list[str]:
-        """files with zero or very few incoming edges (likely entry points)."""
-        entries = []
-        for node in self.graph.nodes:
-            if self.graph.in_degree(node) <= 1:
-                entries.append(node)
-        return entries
+        """Get files with zero or very few incoming edges (likely entry points).
+
+        Returns:
+            List of file paths
+        """
+        return self._precise.get_entry_points()
+
+    def get_related_files(self, file_path: str, max_depth: int = 1) -> set[str]:
+        """Get all files related to a specific file.
+
+        Args:
+            file_path: Starting file path
+            max_depth: Maximum traversal depth
+
+        Returns:
+            Set of related file paths
+        """
+        return self._precise.get_related_files(file_path, max_depth)
+
+    def get_file_imports(self, file_path: str) -> list[dict]:
+        """Get all imports from a specific file.
+
+        Args:
+            file_path: File path
+
+        Returns:
+            List of import dicts with module, kind, line, is_external
+        """
+        imports = self._precise.get_file_imports(file_path)
+        return [
+            {
+                "module": imp.target_module,
+                "kind": imp.import_kind.value,
+                "line": imp.line_number,
+                "is_external": imp.is_external,
+            }
+            for imp in imports
+        ]
+
+    def get_file_importers(self, file_path: str) -> list[str]:
+        """Get all files that import a specific file.
+
+        Args:
+            file_path: Target file path
+
+        Returns:
+            List of source file paths
+        """
+        return self._precise.get_file_importers(file_path)
 
 
+# Keep helper functions for backward compatibility
 def _get_module(path: str) -> str:
+    """Extract module name (top-level directory) from file path.
+
+    Args:
+        path: File path
+
+    Returns:
+        Module name
+    """
     parts = Path(path).parts
     if len(parts) <= 1:
         return "root"
@@ -180,7 +232,14 @@ def _get_module(path: str) -> str:
 
 
 def _mermaid_id(name: str) -> str:
-    """make a valid Mermaid node ID from a module name."""
+    """Convert name to valid Mermaid node ID.
+
+    Args:
+        name: Original name
+
+    Returns:
+        Sanitized Mermaid ID
+    """
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
 
@@ -190,48 +249,17 @@ def _resolve_import(
     language: str,
     known_paths: set[str],
 ) -> str | None:
-    """try to resolve an import string to an actual file path in the project."""
-    if language in ("python", "pyi"):
-        # convert dots to slashes: "foo.bar.baz" -> "foo/bar/baz"
-        rel = import_path.replace(".", "/")
-        candidates = [
-            f"{rel}.py",
-            f"{rel}/__init__.py",
-            f"src/{rel}.py",
-            f"src/{rel}/__init__.py",
-        ]
-    elif language in ("javascript", "typescript", "jsx", "tsx", "mjs", "cjs"):
-        if import_path.startswith("."):
-            # relative import
-            base_dir = str(Path(source_file).parent)
-            rel = str(Path(base_dir) / import_path)
-        else:
-            rel = import_path
-        candidates = [
-            rel,
-            f"{rel}.ts", f"{rel}.tsx", f"{rel}.js", f"{rel}.jsx",
-            f"{rel}/index.ts", f"{rel}/index.tsx", f"{rel}/index.js",
-        ]
-    elif language == "go":
-        # go imports are package paths, hard to resolve without go.mod
-        parts = import_path.split("/")
-        if len(parts) >= 2:
-            candidates = [f"{'/'.join(parts[-2:])}.go"]
-        else:
-            return None
-    elif language == "rust":
-        rel = import_path.split("::")[0].replace("::", "/")
-        candidates = [f"src/{rel}.rs", f"src/{rel}/mod.rs", f"{rel}.rs"]
-    elif language == "java":
-        rel = import_path.replace(".", "/")
-        candidates = [f"src/main/java/{rel}.java", f"{rel}.java"]
-    else:
-        return None
+    """Resolve import path to actual file path.
 
-    for c in candidates:
-        # normalize path
-        c = str(Path(c))
-        if c in known_paths:
-            return c
+    Args:
+        import_path: Import path string
+        source_file: Source file path
+        language: Programming language
+        known_paths: Set of known file paths
 
-    return None
+    Returns:
+        Resolved file path or None
+    """
+    from repowiki.core.parsers import resolve_import
+
+    return resolve_import(import_path, source_file, language, known_paths)
