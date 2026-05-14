@@ -28,6 +28,61 @@ from repowiki.llm.prompts import (
 logger = logging.getLogger(__name__)
 
 
+def detect_project_type(files: list[FileInfo]) -> str:
+    """Detect project type from file list.
+
+    Returns one of: backend-app, frontend-app, cli-tool, library,
+    full-stack, monorepo, or unknown
+    """
+    has_frontend_markers = any(
+        f.path in ("package.json", "tsconfig.json", "vite.config.ts", "webpack.config.js")
+        or f.path.startswith("src/") and any(ext in f.path for ext in (".tsx", ".jsx", ".vue", ".svelte"))
+        for f in files
+    )
+
+    has_backend_markers = any(
+        f.path in ("requirements.txt", "pyproject.toml", "setup.py", "Gemfile", "go.mod", "Cargo.toml")
+        or "app.py" in f.path or "server.py" in f.path
+        or f.path.startswith("src/") and f.language in ("python", "go", "rust")
+        for f in files
+    )
+
+    has_cli_markers = any(
+        f.path in ("setup.py", "pyproject.toml")
+        and f.content
+        and ("console_scripts" in f.content or "entry_points" in f.content or "scripts" in f.content)
+        for f in files
+    )
+
+    has_monorepo_markers = any(
+        "packages/" in f.path or "workspace" in f.path or "monorepo" in f.path.lower()
+        for f in files
+    )
+
+    has_ui_files = any(
+        f.path.startswith("src/") and any(ext in f.path for ext in (".tsx", ".jsx", ".vue", ".svelte"))
+        for f in files
+    )
+
+    if has_monorepo_markers:
+        return "monorepo"
+    if has_frontend_markers and has_backend_markers:
+        return "full-stack"
+    if has_frontend_markers or has_ui_files:
+        return "frontend-app"
+    if has_backend_markers:
+        return "backend-app"
+    if has_cli_markers:
+        return "cli-tool"
+
+    # Check if it's a library (mostly .py files in src/ or lib/)
+    code_files = [f for f in files if f.language in ("python", "rust", "go") and not f.is_config]
+    if len(code_files) > 5:
+        return "library"
+
+    return "unknown"
+
+
 class Analyzer:
     """runs the full wiki generation pipeline."""
 
@@ -42,6 +97,29 @@ class Analyzer:
         self.cache = cache
         self.language = language
         self._sem = asyncio.Semaphore(concurrency)
+
+    async def _call_llm_with_retry(
+        self,
+        messages: list[dict],
+        *,
+        max_tokens: int = 4096,
+        max_retries: int = 3,
+    ) -> str:
+        """Call LLM with exponential backoff retry on failure."""
+        for attempt in range(max_retries):
+            try:
+                return await self.llm.complete(messages, max_tokens=max_tokens)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.warning("LLM call failed after %d attempts: %s", max_retries, e)
+                    return ""
+                wait_time = 2 ** attempt
+                logger.warning(
+                    "LLM call failed (attempt %d/%d), retrying in %ds: %s",
+                    attempt + 1, max_retries, wait_time, e,
+                )
+                await asyncio.sleep(wait_time)
+        return ""
 
     async def analyze(
         self,
@@ -112,7 +190,7 @@ class Analyzer:
                 pass
 
         messages = build_overview_prompt(project.file_tree, key_files, self.language)
-        raw = await self.llm.complete(messages, max_tokens=4096)
+        raw = await self._call_llm_with_retry(messages, max_tokens=4096)
         data = extract_json(raw)
         if not data or not isinstance(data, dict):
             logger.warning("Failed to parse overview JSON, using defaults")
@@ -196,7 +274,7 @@ class Analyzer:
                     pass
 
             messages = build_module_prompt(name, files_context, project_summary, self.language)
-            raw = await self.llm.complete(messages, max_tokens=4096)
+            raw = await self._call_llm_with_retry(messages, max_tokens=4096)
             data = extract_json(raw)
             if not data or not isinstance(data, dict):
                 logger.warning("Failed to parse module '%s' JSON", name)
@@ -224,7 +302,7 @@ class Analyzer:
                 pass
 
         messages = build_architecture_prompt(project.file_tree, key_files, self.language)
-        raw = await self.llm.complete(messages, max_tokens=4096)
+        raw = await self._call_llm_with_retry(messages, max_tokens=4096)
         data = extract_json(raw)
         if not data or not isinstance(data, dict):
             logger.warning("Failed to parse architecture JSON")
@@ -269,7 +347,7 @@ class Analyzer:
         module_summaries = "\n".join(module_parts)
 
         messages = build_reading_guide_prompt(rankings, module_summaries, self.language)
-        raw = await self.llm.complete(messages, max_tokens=4096)
+        raw = await self._call_llm_with_retry(messages, max_tokens=4096)
         data = extract_json(raw)
         if not data or not isinstance(data, dict):
             logger.warning("Failed to parse reading guide JSON")
