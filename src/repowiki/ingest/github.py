@@ -14,7 +14,7 @@ from repowiki.ingest.local import ingest_local
 logger = logging.getLogger(__name__)
 
 _CLONE_DIR = Path.home() / ".repowiki" / "repos"
-_CLONE_TIMEOUT = 120  # seconds
+_CLONE_TIMEOUT_SECONDS = 120  # seconds
 _MAX_REPO_SIZE_MB = 500
 
 # matches github/gitlab/bitbucket URLs in various formats
@@ -75,7 +75,7 @@ def ingest_github(
     try:
         subprocess.run(
             ["git", "clone", "--depth", "1", "--single-branch", clone_url, str(dest)],
-            timeout=_CLONE_TIMEOUT,
+            timeout=_CLONE_TIMEOUT_SECONDS,
             check=True,
             capture_output=True,
             text=True,
@@ -84,7 +84,7 @@ def ingest_github(
         # clean up partial clone
         if dest.exists():
             shutil.rmtree(dest)
-        raise RuntimeError(f"Clone timed out after {_CLONE_TIMEOUT}s: {clone_url}")
+        raise RuntimeError(f"Clone timed out after {_CLONE_TIMEOUT_SECONDS}s: {clone_url}")
     except subprocess.CalledProcessError as e:
         if dest.exists():
             shutil.rmtree(dest)

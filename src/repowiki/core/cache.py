@@ -67,6 +67,13 @@ class Cache:
         )
         await self._db.commit()
 
+    async def delete(self, key: str) -> None:
+        """Delete a cache entry by key. Used to force regeneration of failed docs."""
+        if not self._db:
+            return
+        await self._db.execute("DELETE FROM cache WHERE key = ?", (key,))
+        await self._db.commit()
+
     async def save_project(self, project_id: str, data: dict) -> None:
         if not self._db:
             return

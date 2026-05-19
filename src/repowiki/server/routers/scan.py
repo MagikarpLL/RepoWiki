@@ -115,7 +115,7 @@ async def _run_scan(project_id: str, req: ScanRequest, user_api_key: str | None)
 
         cache = get_cache()
         llm = LLMClient(model=cfg.model, api_key=cfg.api_key, api_base=cfg.api_base)
-        analyzer = Analyzer(llm=llm, cache=cache, language=cfg.language, concurrency=cfg.concurrency)
+        analyzer = Analyzer(llm=llm, cache=cache, language=cfg.language, concurrency=cfg.concurrency, retry_failed=cfg.retry_failed)
 
         wiki_data = await analyzer.analyze(project, on_progress=progress)
 
@@ -131,3 +131,6 @@ async def _run_scan(project_id: str, req: ScanRequest, user_api_key: str | None)
         proj["info"].status = "error"
         proj["info"].error = str(e)
         proj["progress"].append(f"Error: {e}")
+    finally:
+        if 'llm' in locals():
+            await llm.close()

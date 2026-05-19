@@ -8,7 +8,7 @@ from pathlib import Path
 from repowiki.core.wiki_builder import Wiki
 
 
-def export_html(wiki: Wiki, output_path: str | Path) -> None:
+def export_html(wiki: Wiki, output_path: str | Path, generation_mode: str = "full") -> None:
     """generate a single self-contained HTML file with sidebar navigation."""
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)

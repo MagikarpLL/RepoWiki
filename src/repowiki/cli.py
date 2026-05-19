@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import sys
+from pathlib import Path
+
 import click
 from rich.console import Console
 from rich.table import Table
@@ -12,6 +16,44 @@ from repowiki.config import Config, resolve_model
 from repowiki.ingest.github import parse_git_url
 
 console = Console()
+
+
+def _setup_logging(log_dir: str | None) -> None:
+    """Configure logging to file and/or console based on log_dir config."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG if logging.getLogger().level == logging.DEBUG else logging.INFO)
+
+    # Remove existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Console handler (always)
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.WARNING)  # Show warnings and above on console
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    root_logger.addHandler(console_handler)
+
+    # File handler if log_dir is configured
+    if log_dir:
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        log_file = log_path / "repowiki.log"
+
+        # Rotate: keep last 5 runs
+        if log_file.exists():
+            import shutil
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rotated = log_path / f"repowiki_{timestamp}.log"
+            shutil.move(str(log_file), str(rotated))
+
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        root_logger.addHandler(file_handler)
+        console.print(f"[dim]Logging to: {log_file}[/dim]")
 
 
 def _is_url(s: str) -> bool:
@@ -26,7 +68,7 @@ def cli():
 
 
 @cli.command()
-@click.argument("path_or_url")
+@click.argument("path_or_url", default=None, required=False)
 @click.option("-o", "--output", default=None, help="Output directory (default: ./wiki)")
 @click.option(
     "-f", "--format", "fmt",
@@ -37,9 +79,20 @@ def cli():
 @click.option("-l", "--lang", default=None, help="Output language (en/zh/ja/ko)")
 @click.option("-m", "--model", default=None, help="LLM model name or alias")
 @click.option("--open", "open_browser", is_flag=True, help="Open HTML output in browser")
-def scan(path_or_url: str, output: str | None, fmt: str, lang: str | None,
+def scan(path_or_url: str | None, output: str | None, fmt: str, lang: str | None,
          model: str | None, open_browser: bool):
-    """Scan a local directory or GitHub URL and generate wiki documentation."""
+    """Scan a local directory or GitHub URL and generate wiki documentation.
+
+    If no path is provided, uses project_path from config.json.
+    """
+    cfg = Config.load()
+
+    # Setup logging early (before any operations that might log)
+    _setup_logging(cfg.log_dir)
+
+    # Use project_path from config if no path provided
+    if path_or_url is None:
+        path_or_url = cfg.project_path
     cfg = Config.load()
     if lang:
         cfg.language = lang
@@ -98,22 +151,61 @@ def scan(path_or_url: str, output: str | None, fmt: str, lang: str | None,
         )
         return
 
-    # phase 2 will add LLM analysis here
     import asyncio
     asyncio.run(_run_analysis(project, cfg, fmt, open_browser))
 
 
 async def _run_analysis(project, cfg: Config, fmt: str, open_browser: bool):
     """run the full LLM analysis pipeline."""
+    from pathlib import Path
+
     from repowiki.core.analyzer import Analyzer
     from repowiki.core.cache import Cache
+    from repowiki.core.models import DocGenerationRecord
     from repowiki.llm.client import LLMClient
 
     llm = LLMClient(model=cfg.model, api_key=cfg.api_key, api_base=cfg.api_base)
     cache = Cache()
     await cache.init()
 
-    analyzer = Analyzer(llm=llm, cache=cache, language=cfg.language, concurrency=cfg.concurrency)
+    # Clear cache when full mode (clean slate)
+    if cfg.generation_mode == "full":
+        import os
+        cache_path = os.path.expanduser("~/.repowiki/cache.db")
+        if os.path.exists(cache_path):
+            await cache.close()
+            os.remove(cache_path)
+            console.print("[yellow]Cache cleared for full mode[/]")
+            cache = Cache()
+            await cache.init()
+
+    # Load generation record for resume mode
+    generation_record = None
+    if cfg.generation_mode == "resume":
+        record_path = Path(cfg.output_dir) / ".repowiki_doc_status.json"
+        if record_path.exists():
+            try:
+                import json
+                data = json.loads(record_path.read_text(encoding="utf-8"))
+                generation_record = DocGenerationRecord(**data)
+                pending_count = len(generation_record.get_pending_docs())
+                success_count = len(generation_record.get_successful_docs())
+                console.print(f"[yellow]Resume mode: {success_count} docs already generated, {pending_count} pending/failed[/]")
+            except Exception as e:
+                console.print(f"[yellow]Failed to load generation record: {e}, starting fresh[/]")
+                generation_record = None
+        else:
+            console.print("[yellow]Resume mode: no previous record found, starting fresh[/]")
+
+    analyzer = Analyzer(
+        llm=llm, 
+        cache=cache, 
+        language=cfg.language, 
+        concurrency=cfg.concurrency, 
+        retry_failed=cfg.retry_failed,
+        generation_mode=cfg.generation_mode,
+        generation_record=generation_record,
+    )
 
     from rich.progress import Progress, SpinnerColumn, TextColumn
     with Progress(
@@ -139,7 +231,7 @@ async def _run_analysis(project, cfg: Config, fmt: str, open_browser: bool):
     output_dir = cfg.output_dir
     if fmt == "markdown":
         from repowiki.export.markdown import export_markdown
-        export_markdown(wiki, output_dir)
+        export_markdown(wiki, output_dir, generation_mode=cfg.generation_mode)
         console.print(f"\n[bold green]Wiki generated:[/] {output_dir}/")
     elif fmt == "json":
         from repowiki.export.json_export import export_json
@@ -149,11 +241,24 @@ async def _run_analysis(project, cfg: Config, fmt: str, open_browser: bool):
     elif fmt == "html":
         from repowiki.export.html import export_html
         out_path = f"{output_dir}/repowiki.html"
-        export_html(wiki, out_path)
+        export_html(wiki, out_path, generation_mode=cfg.generation_mode)
         console.print(f"\n[bold green]Wiki generated:[/] {out_path}")
         if open_browser:
             import webbrowser
             webbrowser.open(f"file://{out_path}")
+
+    # Save generation record for resume mode
+    if cfg.generation_mode == "resume" and analyzer.generation_record:
+        record_path = Path(cfg.output_dir) / ".repowiki_doc_status.json"
+        try:
+            import json
+            record_data = analyzer.generation_record.model_dump()
+            record_path.write_text(json.dumps(record_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            success_count = len(analyzer.generation_record.get_successful_docs())
+            pending_count = len(analyzer.generation_record.get_pending_docs())
+            console.print(f"[dim]Generation record saved: {success_count} success, {pending_count} pending/failed[/]")
+        except Exception as e:
+            console.print(f"[yellow]Failed to save generation record: {e}[/]")
 
     # show token usage
     if llm.total_input_tokens or llm.total_output_tokens:
@@ -164,6 +269,7 @@ async def _run_analysis(project, cfg: Config, fmt: str, open_browser: bool):
         )
 
     await cache.close()
+    await llm.close()
 
 
 def _build_rich_tree(tree: Tree, files, max_entries: int = 30):
@@ -220,7 +326,6 @@ def serve(path_or_url: str, port: int):
 def chat(path_or_url: str):
     """Ask questions about a codebase in the terminal."""
     console.print("[bold cyan]RepoWiki Chat[/] (type 'exit' to quit)\n")
-    # phase 4 will implement this
     console.print("[yellow]Chat mode coming soon. Use `repowiki scan` for now.[/]")
 
 

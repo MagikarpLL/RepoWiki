@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncGenerator
 
@@ -22,6 +23,19 @@ class LLMClient:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_cost = 0.0
+
+    async def close(self):
+        """Close all async clients and sessions created by litellm."""
+        try:
+            if hasattr(litellm, 'close_litellm_async_clients'):
+                await litellm.close_litellm_async_clients()
+        except Exception as e:
+            logger.debug("Error closing litellm async clients: %s", e)
+        # Allow pending async operations to complete to avoid "Unclosed client session" warning
+        try:
+            await asyncio.sleep(0)
+        except Exception:
+            pass
 
     async def complete(
         self,
@@ -59,8 +73,8 @@ class LLMClient:
         try:
             cost = litellm.completion_cost(completion_response=resp)
             self.total_cost += cost
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to calculate LLM cost: %s", e)
 
         return resp.choices[0].message.content or ""
 

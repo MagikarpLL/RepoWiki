@@ -6,7 +6,8 @@ import logging
 import os
 from pathlib import Path
 
-from repowiki.core.models import FileInfo
+from repowiki.config import DEFAULT_MAX_FILE_SIZE, DEFAULT_MAX_FILES
+from repowiki.core.models import FileChunk, FileInfo
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,22 @@ _LANG_MAP = {
     ".dockerfile": "dockerfile",
 }
 
+# Languages that are considered "code" - these get processed even if large
+_CODE_LANGUAGES = {
+    "python", "javascript", "typescript", "jsx", "tsx",
+    "go", "rust", "java", "kotlin", "scala",
+    "c", "cpp", "csharp", "ruby", "php", "swift",
+    "lua", "dart", "vue", "svelte", "zig", "nim",
+    "elixir", "erlang", "haskell", "ocaml", "clojure",
+    "shell", "sql",
+}
+
+
+def _is_code_file_by_ext(path: str) -> bool:
+    """Check if file extension indicates a code file (before reading content)."""
+    ext = Path(path).suffix.lower()
+    return ext in _LANG_MAP and _LANG_MAP[ext] in _CODE_LANGUAGES
+
 # files that give the LLM project context -- always read in full
 _CONFIG_FILES = {
     "requirements.txt", "setup.py", "setup.cfg", "pyproject.toml",
@@ -152,6 +169,127 @@ def _is_entrypoint(rel_path: str) -> bool:
     return False
 
 
+# Chunking thresholds
+MAX_UNCHUNKED_SIZE = 4000  # chars, files larger than this get chunked
+PREVIEW_LINES_FOR_LARGE = 200  # preview lines for chunked files
+
+
+def _chunk_by_structure(content: str) -> list[FileChunk]:
+    """Split a large file into chunks at structural boundaries (class, function, method, etc.).
+
+    This preserves code structure integrity - chunks won't cut in the middle of a function
+    or class definition. Each chunk is a complete structural unit.
+    """
+    import re
+
+    from repowiki.core.models import FileChunk
+
+    # Multi-language structural patterns
+    STRUCT_PATTERNS = [
+        # Classes (Java, Python, TypeScript, etc.)
+        (r'^class\s+(\w+)', 'class'),
+        (r'^public\s+class\s+(\w+)', 'class'),
+        (r'^private\s+class\s+(\w+)', 'class'),
+        (r'^protected\s+class\s+(\w+)', 'class'),
+        (r'^(?:abstract\s+)?class\s+(\w+)', 'class'),
+        # Python functions/methods
+        (r'^def\s+(\w+)', 'function'),
+        (r'^async\s+def\s+(\w+)', 'function'),
+        # JavaScript/TypeScript functions
+        (r'^function\s+(\w+)', 'function'),
+        # Go functions
+        (r'^func\s+(\w+)', 'function'),
+        # Java/Kotlin methods (with various modifiers)
+        (r'^(?:public|private|protected)\s+(?:static\s+)?(?:final\s+)?(?:\w+\s+)+\w+\s*\([^(]*\)', 'method'),
+        # Kotlin extension functions
+        (r'^(?:fun\s+)?\w+\s*\.\w+\s*\(', 'method'),
+        # Rust functions
+        (r'^pub\s+fn\s+(\w+)', 'function'),
+        (r'^fn\s+(\w+)', 'function'),
+        # Interfaces
+        (r'^interface\s+(\w+)', 'interface'),
+        # Enums
+        (r'^enum\s+(\w+)', 'enum'),
+        # Structs
+        (r'^struct\s+(\w+)', 'struct'),
+        # C/C++ structs and classes
+        (r'^(?:struct|class)\s+\w+', 'class'),
+    ]
+
+    compiled_patterns = [(re.compile(p, re.MULTILINE), stype) for p, stype in STRUCT_PATTERNS]
+
+    lines = content.split('\n')
+    total_lines = len(lines)
+
+    chunks = []
+    current_lines = []
+    current_len = 0
+    current_struct = None
+    current_name = None
+
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+
+        # Detect structural boundary
+        matched = None
+        for pattern, stype in compiled_patterns:
+            if pattern.match(line_stripped):
+                matched = stype
+                # Try to extract name
+                for p_str, _ in STRUCT_PATTERNS:
+                    m = re.match(p_str, line_stripped)
+                    if m and m.groups():
+                        current_name = m.group(1)
+                        break
+                if current_name is None:
+                    current_name = stype
+                break
+
+        is_struct_boundary = matched is not None
+
+        # Decide whether to split
+        should_split = False
+        if current_len >= MAX_UNCHUNKED_SIZE and current_lines:
+            should_split = True
+        if is_struct_boundary and current_len >= MAX_UNCHUNKED_SIZE * 0.6 and current_lines:
+            should_split = True
+
+        if should_split:
+            start = i - len(current_lines)
+            chunks.append(FileChunk(
+                chunk_id=f"chunk-{len(chunks)}",
+                content='\n'.join(current_lines),
+                start_line=start + 1,  # 1-indexed
+                end_line=i,
+                chunk_type=current_struct or "block",
+                chunk_name=current_name or f"block-{len(chunks)}"
+            ))
+            current_lines = []
+            current_len = 0
+            current_struct = None
+            current_name = None
+
+        current_lines.append(line)
+        current_len += len(line) + 1
+
+        if matched:
+            current_struct = matched
+
+    # Save last chunk
+    if current_lines:
+        start = total_lines - len(current_lines)
+        chunks.append(FileChunk(
+            chunk_id=f"chunk-{len(chunks)}",
+            content='\n'.join(current_lines),
+            start_line=start + 1,
+            end_line=total_lines,
+            chunk_type=current_struct or "tail",
+            chunk_name=current_name or "tail"
+        ))
+
+    return chunks
+
+
 def build_file_tree(files: list[FileInfo], max_lines: int = 200) -> str:
     """render an ascii tree from the file list, similar to `tree` command."""
     # collect unique directories + files
@@ -179,16 +317,20 @@ def build_file_tree(files: list[FileInfo], max_lines: int = 200) -> str:
 
 def scan_directory(
     root: str | Path,
-    max_file_size: int = 200 * 1024,
-    max_files: int = 1000,
+    max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+    max_files: int = DEFAULT_MAX_FILES,
     preview_lines: int = 80,
 ) -> list[FileInfo]:
-    """walk a project directory and return file info with previews."""
+    """walk a project directory and return file info with previews.
+
+    Uses parallel processing for file I/O with ThreadPoolExecutor.
+    """
     root = Path(root).resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Not a directory: {root}")
 
-    results: list[FileInfo] = []
+    # First pass: collect all candidate file paths (fast, sequential)
+    candidate_paths: list[tuple[str, Path]] = []  # (rel_path, full_path)
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = [
@@ -197,10 +339,6 @@ def scan_directory(
         ]
 
         for fname in filenames:
-            if len(results) >= max_files:
-                logger.info("Hit file cap (%d), stopping", max_files)
-                break
-
             full = Path(dirpath) / fname
             rel = str(full.relative_to(root))
 
@@ -210,40 +348,60 @@ def scan_directory(
             if _has_skipped_suffix(full):
                 continue
 
-            try:
-                size = full.stat().st_size
-            except OSError:
-                continue
-            if size > max_file_size or size == 0:
-                continue
+            candidate_paths.append((rel, full))
 
-            try:
-                raw = full.read_bytes()
-            except OSError:
-                continue
-            if _is_binary(raw):
-                continue
+            if len(candidate_paths) >= max_files * 2:  # Collect more than needed for filtering
+                break
 
-            try:
-                text = raw.decode("utf-8", errors="replace")
-            except Exception:
-                continue
+        if len(candidate_paths) >= max_files * 2:
+            break
 
-            if _looks_minified_source(rel, text):
-                continue
+    # Second pass: parallel file processing
+    import os as os_module
+    num_workers = min(8, (os_module.cpu_count() or 4))
+    from concurrent.futures import ThreadPoolExecutor
 
-            lang = detect_language(rel)
-            is_cfg = fname in _CONFIG_FILES
-            is_entry = _is_entrypoint(rel)
-            line_count = text.count("\n") + 1
+    def process_file(rel_and_full: tuple[str, Path]) -> FileInfo | None:
+        """Process a single file and return FileInfo or None if skipped."""
+        rel, full = rel_and_full
 
-            # config/entrypoint files get full content for better LLM context
-            if is_cfg or is_entry:
-                preview = text
-            else:
-                preview = "\n".join(text.splitlines()[:preview_lines])
+        try:
+            size = full.stat().st_size
+        except OSError:
+            return None
 
-            results.append(FileInfo(
+        if size == 0:
+            return None
+        if size > max_file_size and not _is_code_file_by_ext(rel):
+            return None
+
+        try:
+            raw = full.read_bytes()
+        except OSError:
+            return None
+
+        if _is_binary(raw):
+            return None
+
+        try:
+            text = raw.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+        if _looks_minified_source(rel, text):
+            return None
+
+        lang = detect_language(rel)
+        fname = os.path.basename(rel)
+        is_cfg = fname in _CONFIG_FILES
+        is_entry = _is_entrypoint(rel)
+        line_count = text.count("\n") + 1
+
+        # Large files get structural chunking for accurate line references
+        if len(text) > MAX_UNCHUNKED_SIZE:
+            chunks = _chunk_by_structure(text)
+            preview = "\n".join(text.splitlines()[:PREVIEW_LINES_FOR_LARGE])
+            return FileInfo(
                 path=rel,
                 size=size,
                 language=lang,
@@ -252,10 +410,34 @@ def scan_directory(
                 content=text,
                 is_config=is_cfg,
                 is_entrypoint=is_entry,
-            ))
+                is_chunked=True,
+                chunks=chunks,
+            )
+        else:
+            # Small files: keep full content, standard preview
+            preview = text if is_cfg or is_entry else "\n".join(text.splitlines()[:preview_lines])
+            return FileInfo(
+                path=rel,
+                size=size,
+                language=lang,
+                lines=line_count,
+                preview=preview,
+                content=text,
+                is_config=is_cfg,
+                is_entrypoint=is_entry,
+                is_chunked=False,
+                chunks=[],
+            )
 
-        if len(results) >= max_files:
-            break
+    # Process files in parallel
+    results: list[FileInfo] = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        file_infos = list(executor.map(process_file, candidate_paths))
+        for fi in file_infos:
+            if fi is not None:
+                results.append(fi)
+                if len(results) >= max_files:
+                    break
 
     # sort: configs first, then entrypoints, then alphabetical
     def _sort_key(f: FileInfo) -> tuple:
@@ -266,4 +448,4 @@ def scan_directory(
         return (2, f.path)
 
     results.sort(key=_sort_key)
-    return results
+    return results[:max_files]

@@ -971,3 +971,647 @@ def resolve_import(
         Resolved file path or None
     """
     return get_parser_registry().resolve(module, source_file, language, known_paths)
+
+
+# ========== Symbol Registry (Symbol-level parsing) ==========
+
+
+from repowiki.core.symbols import SymbolNode, SymbolKind
+
+
+class SymbolRegistry:
+    """Registry for language-specific symbol parsers."""
+
+    def __init__(self):
+        self._parsers: dict[str, callable] = {}
+
+    def register(self, language: str, parser: callable) -> None:
+        """Register a symbol parser for a language.
+
+        Args:
+            language: Language identifier (e.g., 'python', 'java')
+            parser: Function(source, filepath) -> list[SymbolNode]
+        """
+        self._parsers[language] = parser
+
+    def parse_symbols(self, source: str, language: str, filepath: str) -> list[SymbolNode]:
+        """Parse symbols from source code.
+
+        Args:
+            source: Source code content
+            language: Programming language
+            filepath: File path (for context)
+
+        Returns:
+            List of SymbolNode
+        """
+        parser = self._parsers.get(language)
+        if parser:
+            return parser(source, filepath)
+        return []
+
+
+# ========== Python Symbol Parser ==========
+
+
+def parse_python_symbols(source: str, filepath: str) -> list[SymbolNode]:
+    """Parse Python symbols (functions, classes, variables) from source.
+
+    Args:
+        source: Python source code
+        filepath: File path (for symbol ID generation)
+
+    Returns:
+        List of SymbolNode
+    """
+    import ast
+
+    symbols = []
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbols.append(_create_python_function_symbol(node, filepath))
+        elif isinstance(node, ast.ClassDef):
+            symbols.append(_create_python_class_symbol(node, filepath))
+        elif isinstance(node, ast.Assign):
+            # Variable assignments at module/class level
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    symbols.append(_create_python_variable_symbol(target, node, filepath))
+
+    return symbols
+
+
+def _create_python_function_symbol(node: ast.FunctionDef | ast.AsyncFunctionDef, filepath: str) -> SymbolNode:
+    """Create a SymbolNode for a Python function."""
+    # Build signature
+    args = node.args
+    params = []
+
+    # Positional-only args
+    for arg in args.posonlyargs:
+        params.append(arg.arg)
+
+    # Regular args
+    for arg in args.args:
+        params.append(arg.arg)
+
+    # *args
+    if args.vararg:
+        params.append(f"*{args.vararg.arg}")
+
+    # Keyword-only args
+    for arg in args.kwonlyargs:
+        params.append(f"{arg.arg}=")
+
+    # **kwargs
+    if args.kwarg:
+        params.append(f"**{args.kwarg.arg}")
+
+    # Return annotation
+    return_annotation = ""
+    if node.returns:
+        return_annotation = f" -> {ast.unparse(node.returns)}"
+
+    signature = f"def {node.name}({', '.join(params)}){return_annotation}"
+
+    # Get docstring
+    doc = ast.get_docstring(node) or ""
+
+    return SymbolNode(
+        id=f"{filepath}:{node.name}:{node.lineno}",
+        name=node.name,
+        kind=SymbolKind.FUNCTION,
+        file=filepath,
+        line=node.lineno,
+        end_line=node.end_lineno or node.lineno,
+        signature=signature,
+        doc=doc,
+    )
+
+
+def _create_python_class_symbol(node: ast.ClassDef, filepath: str) -> SymbolNode:
+    """Create a SymbolNode for a Python class."""
+    doc = ast.get_docstring(node) or ""
+
+    # Get base classes
+    bases = []
+    for base in node.bases:
+        if isinstance(base, ast.Name):
+            bases.append(base.id)
+        elif isinstance(base, ast.Attribute):
+            bases.append(ast.unparse(base))
+
+    signature = f"class {node.name}"
+    if bases:
+        signature += f"({', '.join(bases)})"
+
+    return SymbolNode(
+        id=f"{filepath}:{node.name}:{node.lineno}",
+        name=node.name,
+        kind=SymbolKind.CLASS,
+        file=filepath,
+        line=node.lineno,
+        end_line=node.end_lineno or node.lineno,
+        signature=signature,
+        doc=doc,
+    )
+
+
+def _create_python_variable_symbol(target: ast.Name, node: ast.Assign, filepath: str) -> SymbolNode:
+    """Create a SymbolNode for a Python variable."""
+    return SymbolNode(
+        id=f"{filepath}:{target.id}:{node.lineno}",
+        name=target.id,
+        kind=SymbolKind.VARIABLE,
+        file=filepath,
+        line=node.lineno,
+        end_line=node.end_lineno or node.lineno,
+        signature="",
+        doc="",
+    )
+
+
+# ========== JavaScript/TypeScript Symbol Parser ==========
+
+
+def parse_js_symbols(source: str, filepath: str) -> list[SymbolNode]:
+    """Parse JavaScript/TypeScript symbols using ast-grep.
+
+    Args:
+        source: JavaScript/TypeScript source code
+        filepath: File path
+
+    Returns:
+        List of SymbolNode
+    """
+    try:
+        from ast_grep_py import SgRoot
+    except ImportError:
+        return _parse_js_symbols_regex(source, filepath)
+
+    symbols = []
+    sg = SgRoot(source, "javascript")
+    root = sg.root()
+
+    # Parse function declarations: function name(...) {...}
+    for fn in root.find_all(pattern="function $NAME($$$ARGS) { $$$BODY }"):
+        name_match = fn.get_match("NAME")
+        if name_match:
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{name_match.text()}:{fn.range().start.line + 1}",
+                name=name_match.text(),
+                kind=SymbolKind.FUNCTION,
+                file=filepath,
+                line=fn.range().start.line + 1,
+                end_line=fn.range().end.line + 1,
+                signature=f"function {name_match.text()}(...)",
+                doc="",
+            ))
+
+    # Parse const/let/var declarations: const name = ...
+    for decl in root.find_all(pattern="const $NAME = $VALUE"):
+        name_match = decl.get_match("NAME")
+        if name_match:
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{name_match.text()}:{decl.range().start.line + 1}",
+                name=name_match.text(),
+                kind=SymbolKind.VARIABLE,
+                file=filepath,
+                line=decl.range().start.line + 1,
+                end_line=decl.range().end.line + 1,
+                signature="",
+                doc="",
+            ))
+
+    # Parse class declarations: class Name {...}
+    for cls in root.find_all(pattern="class $NAME { $$$BODY }"):
+        name_match = cls.get_match("NAME")
+        if name_match:
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{name_match.text()}:{cls.range().start.line + 1}",
+                name=name_match.text(),
+                kind=SymbolKind.CLASS,
+                file=filepath,
+                line=cls.range().start.line + 1,
+                end_line=cls.range().end.line + 1,
+                signature=f"class {name_match.text()}",
+                doc="",
+            ))
+
+    return symbols
+
+
+def _parse_js_symbols_regex(source: str, filepath: str) -> list[SymbolNode]:
+    """Fallback regex parser for JavaScript symbols."""
+    import re
+
+    symbols = []
+
+    # Remove comments
+    filtered_lines = []
+    in_block_comment = False
+    for line in source.split("\n"):
+        if "/*" in line:
+            in_block_comment = True
+        if "*/" in line:
+            in_block_comment = False
+            continue
+        if in_block_comment:
+            continue
+        if "//" in line:
+            line = line[:line.index("//")]
+        filtered_lines.append(line)
+
+    content = "\n".join(filtered_lines)
+
+    # function name(...) {...}
+    for match in re.finditer(r"function\s+(\w+)\s*\([^)]*\)", content):
+        name = match.group(1)
+        line_num = content[:match.start()].count("\n") + 1
+        symbols.append(SymbolNode(
+            id=f"{filepath}:{name}:{line_num}",
+            name=name,
+            kind=SymbolKind.FUNCTION,
+            file=filepath,
+            line=line_num,
+            end_line=line_num,
+            signature=f"function {name}(...)",
+            doc="",
+        ))
+
+    # const/let/var name = ...
+    for match in re.finditer(r"(?:const|let|var)\s+(\w+)\s*=", content):
+        name = match.group(1)
+        line_num = content[:match.start()].count("\n") + 1
+        symbols.append(SymbolNode(
+            id=f"{filepath}:{name}:{line_num}",
+            name=name,
+            kind=SymbolKind.VARIABLE,
+            file=filepath,
+            line=line_num,
+            end_line=line_num,
+            signature="",
+            doc="",
+        ))
+
+    # class Name {...}
+    for match in re.finditer(r"class\s+(\w+)\s*\{", content):
+        name = match.group(1)
+        line_num = content[:match.start()].count("\n") + 1
+        symbols.append(SymbolNode(
+            id=f"{filepath}:{name}:{line_num}",
+            name=name,
+            kind=SymbolKind.CLASS,
+            file=filepath,
+            line=line_num,
+            end_line=line_num,
+            signature=f"class {name}",
+            doc="",
+        ))
+
+    return symbols
+
+
+def parse_typescript_symbols(source: str, filepath: str) -> list[SymbolNode]:
+    """Parse TypeScript symbols (same as JavaScript for now)."""
+    return parse_js_symbols(source, filepath)
+
+
+# ========== Java Symbol Parser ==========
+
+
+def parse_java_symbols(source: str, filepath: str) -> list[SymbolNode]:
+    """Parse Java symbols using tree-sitter.
+
+    Args:
+        source: Java source code
+        filepath: File path
+
+    Returns:
+        List of SymbolNode
+    """
+    try:
+        import tree_sitter_java as tsjava
+        from tree_sitter import Language, Parser, Query
+    except ImportError:
+        return _parse_java_symbols_regex(source, filepath)
+
+    symbols = []
+
+    try:
+        JAVA_LANGUAGE = Language(tsjava.language())
+        parser = Parser(JAVA_LANGUAGE)
+        tree = parser.parse(bytes(source, "utf8"))
+
+        # Query for method declarations
+        METHOD_QUERY = """
+        (method_declaration
+          (identifier) @method_name
+          (modifiers)
+          (type)? @return_type
+          (formal_parameters) @params)
+        """
+        query = Query(JAVA_LANGUAGE, METHOD_QUERY)
+        for node, capture_name in query.captures(tree.root_node):
+            if capture_name == "method_name":
+                method_name = source[node.start_byte:node.end_byte]
+                line_num = node.start_point[0] + 1
+                symbols.append(SymbolNode(
+                    id=f"{filepath}:{method_name}:{line_num}",
+                    name=method_name,
+                    kind=SymbolKind.METHOD,
+                    file=filepath,
+                    line=line_num,
+                    end_line=line_num,
+                    signature=f"{method_name}(...)",
+                    doc="",
+                ))
+
+        # Query for class declarations
+        CLASS_QUERY = """
+        (class_declaration
+          (identifier) @class_name
+          (superclass)? @superclass
+          (interfaces)? @interfaces)
+        """
+        class_query = Query(JAVA_LANGUAGE, CLASS_QUERY)
+        for node, capture_name in class_query.captures(tree.root_node):
+            if capture_name == "class_name":
+                class_name = source[node.start_byte:node.end_byte]
+                line_num = node.start_point[0] + 1
+                symbols.append(SymbolNode(
+                    id=f"{filepath}:{class_name}:{line_num}",
+                    name=class_name,
+                    kind=SymbolKind.CLASS,
+                    file=filepath,
+                    line=line_num,
+                    end_line=line_num,
+                    signature=f"class {class_name}",
+                    doc="",
+                ))
+
+    except Exception:
+        return _parse_java_symbols_regex(source, filepath)
+
+    return symbols
+
+
+def _parse_java_symbols_regex(source: str, filepath: str) -> list[SymbolNode]:
+    """Fallback regex parser for Java symbols."""
+    import re
+
+    symbols = []
+
+    lines = source.split("\n")
+
+    for i, line in enumerate(lines, 1):
+        # Skip comments
+        stripped = line.strip()
+        if stripped.startswith("//"):
+            continue
+        if "//" in line:
+            line = line[:line.index("//")]
+
+        # public/private/protected class Name {...}
+        class_match = re.match(r"(?:public|private|protected)?\s*(?:abstract|final)?\s*class\s+(\w+)", line)
+        if class_match:
+            class_name = class_match.group(1)
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{class_name}:{i}",
+                name=class_name,
+                kind=SymbolKind.CLASS,
+                file=filepath,
+                line=i,
+                end_line=i,
+                signature=f"class {class_name}",
+                doc="",
+            ))
+
+        # public/private/protected return_type method_name(...) {...}
+        method_match = re.match(
+            r"(?:public|private|protected)?\s*(?:static)?\s*(?:final)?\s*(\w+)\s+(\w+)\s*\(",
+            line
+        )
+        if method_match:
+            return_type = method_match.group(1)
+            method_name = method_match.group(2)
+            # Skip constructors and common keywords
+            if method_name not in ("if", "while", "for", "switch", "class", "interface"):
+                symbols.append(SymbolNode(
+                    id=f"{filepath}:{method_name}:{i}",
+                    name=method_name,
+                    kind=SymbolKind.METHOD,
+                    file=filepath,
+                    line=i,
+                    end_line=i,
+                    signature=f"{method_name}(...)",
+                    doc="",
+                ))
+
+    return symbols
+
+
+# ========== Go Symbol Parser ==========
+
+
+def parse_go_symbols(source: str, filepath: str) -> list[SymbolNode]:
+    """Parse Go symbols.
+
+    Args:
+        source: Go source code
+        filepath: File path
+
+    Returns:
+        List of SymbolNode
+    """
+    # Note: goast is a Go library accessed via cgo, not Python.
+    # The goast import may work if properly installed, but the API is Go-style.
+    # For safety, we fall back to regex parsing.
+    return _parse_go_symbols_regex(source, filepath)
+
+
+def _parse_go_symbols_regex(source: str, filepath: str) -> list[SymbolNode]:
+    """Fallback regex parser for Go symbols."""
+    import re
+
+    symbols = []
+
+    lines = source.split("\n")
+
+    for i, line in enumerate(lines, 1):
+        # Skip comments
+        if line.strip().startswith("//"):
+            continue
+
+        # func name(...) {...}
+        func_match = re.match(r"func\s+(\w+)\s*\(", line)
+        if func_match:
+            func_name = func_match.group(1)
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{func_name}:{i}",
+                name=func_name,
+                kind=SymbolKind.FUNCTION,
+                file=filepath,
+                line=i,
+                end_line=i,
+                signature=f"func {func_name}(...)",
+                doc="",
+            ))
+
+        # type Name struct {...}
+        type_match = re.match(r"type\s+(\w+)\s+(struct|interface)", line)
+        if type_match:
+            type_name = type_match.group(1)
+            kind = SymbolKind.INTERFACE if type_match.group(2) == "interface" else SymbolKind.CLASS
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{type_name}:{i}",
+                name=type_name,
+                kind=kind,
+                file=filepath,
+                line=i,
+                end_line=i,
+                signature=f"type {type_name}",
+                doc="",
+            ))
+
+    return symbols
+
+
+# ========== Rust Symbol Parser ==========
+
+
+def parse_rust_symbols(source: str, filepath: str) -> list[SymbolNode]:
+    """Parse Rust symbols using regex.
+
+    Args:
+        source: Rust source code
+        filepath: File path
+
+    Returns:
+        List of SymbolNode
+    """
+    import re
+
+    symbols = []
+
+    lines = source.split("\n")
+
+    for i, line in enumerate(lines, 1):
+        # Skip comments
+        if line.strip().startswith("//"):
+            continue
+
+        # fn name(...) -> ... {...}
+        fn_match = re.match(r"fn\s+(\w+)\s*\(", line)
+        if fn_match:
+            fn_name = fn_match.group(1)
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{fn_name}:{i}",
+                name=fn_name,
+                kind=SymbolKind.FUNCTION,
+                file=filepath,
+                line=i,
+                end_line=i,
+                signature=f"fn {fn_name}(...)",
+                doc="",
+            ))
+
+        # struct Name {...}
+        struct_match = re.match(r"struct\s+(\w+)", line)
+        if struct_match:
+            struct_name = struct_match.group(1)
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{struct_name}:{i}",
+                name=struct_name,
+                kind=SymbolKind.CLASS,
+                file=filepath,
+                line=i,
+                end_line=i,
+                signature=f"struct {struct_name}",
+                doc="",
+            ))
+
+        # enum Name {...}
+        enum_match = re.match(r"enum\s+(\w+)", line)
+        if enum_match:
+            enum_name = enum_match.group(1)
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{enum_name}:{i}",
+                name=enum_name,
+                kind=SymbolKind.CLASS,  # Enum as class-like
+                file=filepath,
+                line=i,
+                end_line=i,
+                signature=f"enum {enum_name}",
+                doc="",
+            ))
+
+        # impl Name {...}
+        impl_match = re.match(r"impl\s+(?:<[^>]+>)?\s*(\w+)", line)
+        if impl_match:
+            impl_name = impl_match.group(1)
+            symbols.append(SymbolNode(
+                id=f"{filepath}:{impl_name}:{i}",
+                name=f"impl_{impl_name}",
+                kind=SymbolKind.CLASS,  # Impl as class-like
+                file=filepath,
+                line=i,
+                end_line=i,
+                signature=f"impl {impl_name}",
+                doc="",
+            ))
+
+    return symbols
+
+
+# ========== Symbol Registry Factory ==========
+
+
+# Singleton instance
+_symbol_registry: Optional[SymbolRegistry] = None
+
+
+def get_symbol_registry() -> SymbolRegistry:
+    """Get the default symbol registry singleton.
+
+    Returns:
+        SymbolRegistry instance
+    """
+    global _symbol_registry
+    if _symbol_registry is None:
+        _symbol_registry = SymbolRegistry()
+
+        # Register language parsers
+        _symbol_registry.register("python", parse_python_symbols)
+        _symbol_registry.register("pyi", parse_python_symbols)
+
+        _symbol_registry.register("javascript", parse_js_symbols)
+        _symbol_registry.register("jsx", parse_js_symbols)
+        _symbol_registry.register("typescript", parse_typescript_symbols)
+        _symbol_registry.register("tsx", parse_typescript_symbols)
+
+        _symbol_registry.register("java", parse_java_symbols)
+        _symbol_registry.register("go", parse_go_symbols)
+        _symbol_registry.register("rust", parse_rust_symbols)
+
+    return _symbol_registry
+
+
+def parse_symbols(source: str, language: str, filepath: str) -> list[SymbolNode]:
+    """Convenience function to parse symbols.
+
+    Args:
+        source: Source code
+        language: Programming language
+        filepath: File path
+
+    Returns:
+        List of SymbolNode
+    """
+    return get_symbol_registry().parse_symbols(source, language, filepath)

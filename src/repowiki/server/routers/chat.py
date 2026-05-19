@@ -75,4 +75,7 @@ async def chat(project_id: str, req: ChatRequest, x_api_key: str | None = Header
 
         yield f"data: {json.dumps({'done': True})}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    try:
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+    finally:
+        await llm.close()

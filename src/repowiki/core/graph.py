@@ -65,49 +65,61 @@ class DependencyGraph:
         for f in files:
             precise.add_file(f["path"], f["language"], f["lines"])
 
-        # Parse imports using the registry and create edges
-        for f in files:
+        # Parse imports using the registry and create edges (parallelized)
+        import os
+        num_workers = min(8, (os.cpu_count() or 4))
+        from concurrent.futures import ThreadPoolExecutor
+
+        def parse_file_imports(f: dict) -> list[tuple]:
+            """Parse imports for a single file, return list of (import_obj, file_path, language)."""
             content = f.get("content") or f.get("preview", "")
             if not content:
-                continue
-
-            imports = registry.parse(content, f["language"], f["path"])
+                return []
+            file_path = f["path"]
+            language = f["language"]
+            imports = registry.parse(content, language, file_path)
+            result = []
             for imp in imports:
-                from repowiki.core.precise_graph import ImportKind
+                result.append((imp, file_path, language))
+            return result
 
-                # Convert string kind to ImportKind enum
-                kind_mapping = {
-                    "import": ImportKind.IMPORT,
-                    "from": ImportKind.FROM,
-                    "require": ImportKind.REQUIRE,
-                    "static": ImportKind.STATIC_IMPORT,
-                    "wildcard": ImportKind.WILDCARD,
-                    "table": ImportKind.TABLE_REFERENCE,
-                    "view": ImportKind.VIEW_REFERENCE,
-                    "procedure": ImportKind.PROCEDURE_CALL,
-                    "function": ImportKind.FUNCTION_CALL,
-                    "sql_file": ImportKind.SQL_FILE_REFERENCE,
-                }
-                import_kind = kind_mapping.get(imp.kind, ImportKind.IMPORT)
+        # Parallel import parsing with ThreadPoolExecutor
+        all_imports: list[tuple] = []
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            import_list_per_file = list(executor.map(parse_file_imports, files))
+            for import_list in import_list_per_file:
+                all_imports.extend(import_list)
 
-                # Resolve target file
-                target_file = registry.resolve(
-                    imp.module, f["path"], f["language"], path_set
+        # Add edges from parsed imports (no dependency on parsing order)
+        from repowiki.core.precise_graph import ImportKind, ImportStatement
+
+        kind_mapping = {
+            "import": ImportKind.IMPORT,
+            "from": ImportKind.FROM,
+            "require": ImportKind.REQUIRE,
+            "static": ImportKind.STATIC_IMPORT,
+            "wildcard": ImportKind.WILDCARD,
+            "table": ImportKind.TABLE_REFERENCE,
+            "view": ImportKind.VIEW_REFERENCE,
+            "procedure": ImportKind.PROCEDURE_CALL,
+            "function": ImportKind.FUNCTION_CALL,
+            "sql_file": ImportKind.SQL_FILE_REFERENCE,
+        }
+
+        for imp, f_path, lang in all_imports:
+            import_kind = kind_mapping.get(imp.kind, ImportKind.IMPORT)
+            target_file = registry.resolve(imp.module, f_path, lang, path_set)
+            precise.add_import(
+                ImportStatement(
+                    source_file=f_path,
+                    target_module=imp.module,
+                    target_file=target_file,
+                    import_kind=import_kind,
+                    line_number=imp.line,
+                    is_external=imp.is_external,
+                    raw_statement=imp.raw,
                 )
-
-                from repowiki.core.precise_graph import ImportStatement
-
-                precise.add_import(
-                    ImportStatement(
-                        source_file=f["path"],
-                        target_module=imp.module,
-                        target_file=target_file,
-                        import_kind=import_kind,
-                        line_number=imp.line,
-                        is_external=imp.is_external,
-                        raw_statement=imp.raw,
-                    )
-                )
+            )
 
         return cls(precise_graph=precise)
 
@@ -210,56 +222,3 @@ class DependencyGraph:
             List of source file paths
         """
         return self._precise.get_file_importers(file_path)
-
-
-# Keep helper functions for backward compatibility
-def _get_module(path: str) -> str:
-    """Extract module name (top-level directory) from file path.
-
-    Args:
-        path: File path
-
-    Returns:
-        Module name
-    """
-    parts = Path(path).parts
-    if len(parts) <= 1:
-        return "root"
-    mod = parts[0]
-    if mod in ("src", "lib", "pkg", "internal", "app") and len(parts) > 2:
-        return parts[1]
-    return mod
-
-
-def _mermaid_id(name: str) -> str:
-    """Convert name to valid Mermaid node ID.
-
-    Args:
-        name: Original name
-
-    Returns:
-        Sanitized Mermaid ID
-    """
-    return re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-
-def _resolve_import(
-    import_path: str,
-    source_file: str,
-    language: str,
-    known_paths: set[str],
-) -> str | None:
-    """Resolve import path to actual file path.
-
-    Args:
-        import_path: Import path string
-        source_file: Source file path
-        language: Programming language
-        known_paths: Set of known file paths
-
-    Returns:
-        Resolved file path or None
-    """
-    from repowiki.core.parsers import resolve_import
-
-    return resolve_import(import_path, source_file, language, known_paths)
